@@ -14,16 +14,16 @@ import { analyzeWallet } from "@/lib/fraudChecks";
 import { CONTRACT_ADDRESS, CONTRACT_ABI } from "@/lib/contract";
 
 const STATUS_MESSAGES = [
-  "Establishing connection to Ritual Chain…",
-  "Fetching transaction history…",
-  "Mapping counterparty network…",
-  "Running pattern analysis…",
-  "Checking burst activity…",
-  "Analyzing transfer flows…",
-  "Computing behavioral signatures…",
-  "Consulting CIPHER…",
-  "Generating risk assessment…",
-  "Finalizing report…",
+  "Establishing connection to Ritual Chain...",
+  "Fetching transaction history...",
+  "Mapping counterparty network...",
+  "Running pattern analysis...",
+  "Checking burst activity...",
+  "Analyzing transfer flows...",
+  "Computing behavioral signatures...",
+  "Consulting CIPHER...",
+  "Generating risk assessment...",
+  "Finalizing report...",
 ];
 
 interface CipherResult {
@@ -51,6 +51,7 @@ function DashboardInner() {
   const [error, setError] = useState<string | null>(null);
   const [scannedAddress, setScannedAddress] = useState("");
   const [pendingTxHash, setPendingTxHash] = useState<`0x${string}` | undefined>();
+  const [txRecording, setTxRecording] = useState(false);
   const statusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const { writeContractAsync } = useWriteContract();
@@ -74,7 +75,7 @@ function DashboardInner() {
     setProgress(0);
     statusIntervalRef.current = setInterval(() => {
       idx++;
-      setStatusIdx((prev) => Math.min(prev + 1, STATUS_MESSAGES.length - 1));
+      setStatusIdx(Math.min(idx, STATUS_MESSAGES.length - 1));
       setProgress(Math.min((idx / STATUS_MESSAGES.length) * 100, 95));
     }, 900);
   };
@@ -87,93 +88,125 @@ function DashboardInner() {
     setProgress(100);
   };
 
+  // Record scan on-chain AFTER results are shown -- non-blocking
+  const recordOnChain = async (cipherResult: CipherResult, target: string) => {
+    if (!isConnected || !address) return;
+    setTxRecording(true);
+    try {
+      const reportHash = keccak256(toBytes(JSON.stringify(cipherResult))) as `0x${string}`;
+      const txHash = await writeContractAsync({
+        address: CONTRACT_ADDRESS,
+        abi: CONTRACT_ABI,
+        functionName: "recordScan",
+        args: [target as `0x${string}`, cipherResult.riskLevel, reportHash],
+        value: parseEther("0.001"),
+      });
+      setPendingTxHash(txHash);
+    } catch (err) {
+      console.warn("Contract recording failed or rejected:", err);
+    } finally {
+      setTxRecording(false);
+    }
+  };
+
   const runScan = async () => {
-    if (!inputAddress || !inputAddress.startsWith("0x") || inputAddress.length !== 42) {
-      setError("Please enter a valid wallet address (0x...)");
+    const trimmed = inputAddress.trim();
+    if (!trimmed || !trimmed.startsWith("0x") || trimmed.length !== 42) {
+      setError("Please enter a valid wallet address (starts with 0x, 42 characters).");
       return;
     }
 
     setError(null);
     setResult(null);
+    setPendingTxHash(undefined);
     setScanning(true);
-    setScannedAddress(inputAddress);
+    setScannedAddress(trimmed);
     startStatusCycle();
 
     try {
-      // Step 1: Run rule-based checks
-      const { walletData, flags } = await analyzeWallet(inputAddress);
+      // Step 1: Rule-based on-chain checks
+      let walletData: Awaited<ReturnType<typeof analyzeWallet>>["walletData"];
+      let flags: Awaited<ReturnType<typeof analyzeWallet>>["flags"];
 
-      // Step 2: Call Groq API
+      try {
+        const analysis = await analyzeWallet(trimmed);
+        walletData = analysis.walletData;
+        flags = analysis.flags;
+      } catch (rpcErr) {
+        console.warn("RPC analysis partial failure -- using fallback data:", rpcErr);
+        // Fallback: send minimal data so CIPHER can still run
+        walletData = {
+          transactionCount: 0,
+          walletAgeInDays: 0,
+          uniqueCounterparties: 0,
+          largestInflow: "0.0000",
+          largestOutflow: "0.0000",
+          mostActiveDay: "N/A",
+          avgDailyTransactions: 0,
+        };
+        flags = [
+          { name: "Wallet Age", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Burst Activity", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Fan-Out Pattern", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Rapid Drain", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Round Number Transactions", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Single Counterparty Dominance", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Bot-Like Timing Pattern", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+          { name: "Zero Value Transactions", flagged: false, severity: "low", detail: "RPC data unavailable for this check." },
+        ];
+      }
+
+      // Step 2: Call Groq / CIPHER
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          walletAddress: inputAddress,
-          walletData,
-          flags,
-        }),
+        body: JSON.stringify({ walletAddress: trimmed, walletData, flags }),
       });
 
       if (!res.ok) {
-        throw new Error(`API error: ${res.statusText}`);
+        const errBody = await res.text();
+        throw new Error(`CIPHER API error (${res.status}): ${errBody}`);
       }
 
       const cipherResult: CipherResult = await res.json();
 
-      // Step 3: Pay contract to record scan (if wallet connected)
-      if (isConnected && address) {
-        try {
-          const reportHash = keccak256(
-            toBytes(JSON.stringify(cipherResult))
-          ) as `0x${string}`;
-
-          const txHash = await writeContractAsync({
-            address: CONTRACT_ADDRESS,
-            abi: CONTRACT_ABI,
-            functionName: "recordScan",
-            args: [
-              inputAddress as `0x${string}`,
-              cipherResult.riskLevel,
-              reportHash,
-            ],
-            value: parseEther("0.001"),
-          });
-          setPendingTxHash(txHash);
-        } catch (contractErr) {
-          // Contract call failed (e.g. not deployed yet) — still show results
-          console.warn("Contract recording failed:", contractErr);
-        }
+      if (!cipherResult.riskScore === undefined || !cipherResult.riskLevel || !cipherResult.flagAnalysis) {
+        throw new Error("CIPHER returned an incomplete response. Please try again.");
       }
 
       stopStatusCycle();
+
       setResult(cipherResult);
+      setScanning(false);
+
     } catch (err: unknown) {
       stopStatusCycle();
-      setError(err instanceof Error ? err.message : "Scan failed. Please try again.");
-    } finally {
+      const msg = err instanceof Error ? err.message : "Unknown error occurred.";
+      setError(msg);
       setScanning(false);
     }
   };
 
-  const handleSelectScan = (addr: string, _riskLevel: string) => {
+  const handleSelectScan = (addr: string) => {
     setInputAddress(addr);
+    setResult(null);
+    setError(null);
   };
 
   const resetScan = () => {
     setResult(null);
     setError(null);
     setInputAddress("");
+    setPendingTxHash(undefined);
   };
 
-  const riskScoreColor = result
-    ? result.riskScore <= 15
-      ? "#00ff88"
-      : result.riskScore <= 35
-      ? "#00f5ff"
-      : result.riskScore <= 60
-      ? "#ff9500"
-      : "#ff2d55"
-    : "#00f5ff";
+  function getRiskColor(score: number): string {
+    if (score <= 15) return "#00ff88";
+    if (score <= 35) return "#00f5ff";
+    if (score <= 60) return "#ff9500";
+    return "#ff2d55";
+  }
+  const riskScoreColor = result ? getRiskColor(result.riskScore) : "#00f5ff";
 
   return (
     <div className="min-h-screen bg-cw-black flex flex-col">
@@ -197,6 +230,7 @@ function DashboardInner() {
       <div className="flex flex-1 overflow-hidden">
         {/* Left: Main content */}
         <div className="flex-1 overflow-y-auto px-6 py-8">
+
           {/* Search bar */}
           <motion.div
             initial={{ opacity: 0, y: -20 }}
@@ -226,42 +260,40 @@ function DashboardInner() {
                   disabled={scanning}
                   className="flex-1 px-4 py-3 font-mono text-xs border border-cw-border text-cw-muted hover:border-cw-cyan/40 hover:text-cw-cyan transition-colors disabled:opacity-40"
                 >
-                  ◎ SCAN MY WALLET
+                  o SCAN MY WALLET
                 </button>
               )}
               <button
                 onClick={runScan}
                 disabled={scanning || !inputAddress}
-                className="flex-1 px-6 py-3 font-mono text-sm font-bold text-cw-black transition-all disabled:opacity-40"
+                className="flex-1 px-6 py-3 font-mono text-sm font-bold transition-all disabled:opacity-40"
                 style={{
-                  background: scanning
-                    ? "#1a1a2e"
-                    : "linear-gradient(135deg, #00f5ff, #00b8c4)",
+                  background: scanning ? "#1a1a2e" : "linear-gradient(135deg, #00f5ff, #00b8c4)",
                   color: scanning ? "#6b7280" : "#050508",
                 }}
               >
-                {scanning ? "ANALYZING…" : "▶ RUN SCAN"}
+                {scanning ? "ANALYZING..." : "> RUN SCAN"}
               </button>
             </div>
 
-            {/* Fee notice */}
-            {isConnected && (
-              <p className="font-mono text-xs text-cw-muted mt-2 text-center">
-                Each scan records to chain and costs 0.001 RITUAL
-              </p>
-            )}
+            <p className="font-mono text-xs text-cw-muted mt-2 text-center">
+              On-chain recording optional -- 0.001 RITUAL per scan
+            </p>
           </motion.div>
 
-          {/* Error */}
+          {/* Error display */}
           <AnimatePresence>
             {error && (
               <motion.div
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0 }}
-                className="max-w-3xl mx-auto mb-6 px-4 py-3 border border-cw-red/30 bg-cw-red/5 font-mono text-sm text-cw-red"
+                className="max-w-3xl mx-auto mb-6 px-4 py-3 border border-cw-red/30 bg-cw-red/5"
               >
-                ⚠ {error}
+                <p className="font-mono text-sm text-cw-red">! {error}</p>
+                <p className="font-mono text-xs text-cw-muted mt-1">
+                  Check the browser console (F12) for details if this persists.
+                </p>
               </motion.div>
             )}
           </AnimatePresence>
@@ -276,31 +308,23 @@ function DashboardInner() {
                 className="max-w-3xl mx-auto mb-8"
               >
                 <div className="panel p-6">
-                  {/* Progress bar */}
                   <div className="h-px bg-cw-border mb-6 overflow-hidden">
-                    <motion.div
-                      className="h-full"
+                    <div
+                      className="h-full transition-all duration-700"
                       style={{
                         background: "linear-gradient(90deg, #00f5ff, #00b8c4)",
                         width: `${progress}%`,
-                        transition: "width 0.8s ease",
                         boxShadow: "0 0 10px #00f5ff",
                       }}
                     />
                   </div>
 
-                  {/* Scanning address display */}
                   <div className="mb-4 text-center">
-                    <span className="font-mono text-xs text-cw-muted">
-                      ANALYZING
-                    </span>
+                    <span className="font-mono text-xs text-cw-muted">ANALYZING</span>
                     <br />
-                    <span className="font-mono text-sm text-cw-cyan break-all">
-                      {scannedAddress}
-                    </span>
+                    <span className="font-mono text-sm text-cw-cyan break-all">{scannedAddress}</span>
                   </div>
 
-                  {/* Status message */}
                   <div className="flex items-center justify-center gap-3">
                     <div className="flex gap-1">
                       {[0, 1, 2].map((i) => (
@@ -308,11 +332,7 @@ function DashboardInner() {
                           key={i}
                           className="w-1.5 h-1.5 rounded-full bg-cw-cyan"
                           animate={{ opacity: [0.3, 1, 0.3] }}
-                          transition={{
-                            duration: 1.2,
-                            repeat: Infinity,
-                            delay: i * 0.2,
-                          }}
+                          transition={{ duration: 1.2, repeat: Infinity, delay: i * 0.2 }}
                         />
                       ))}
                     </div>
@@ -324,34 +344,21 @@ function DashboardInner() {
                         exit={{ opacity: 0, y: -5 }}
                         className="font-mono text-sm text-cw-muted"
                       >
-                        {STATUS_MESSAGES[statusIdx]}
+                        {STATUS_MESSAGES[Math.min(statusIdx, STATUS_MESSAGES.length - 1)]}
                       </motion.span>
                     </AnimatePresence>
                   </div>
 
-                  {/* Scan line animation */}
-                  <div
-                    className="mt-6 relative overflow-hidden"
-                    style={{ height: "80px" }}
-                  >
-                    <div
-                      className="absolute inset-0 font-mono text-xs text-cw-cyan/20 leading-5 overflow-hidden select-none"
-                      style={{ fontSize: "10px" }}
-                    >
-                      {Array.from({ length: 6 }, (_, i) => (
-                        <div key={i}>
-                          {Array.from({ length: 60 }, () =>
-                            Math.random() > 0.5 ? "1" : "0"
-                          ).join("")}
-                        </div>
+                  {/* Binary rain decoration */}
+                  <div className="mt-6 relative overflow-hidden" style={{ height: "60px" }}>
+                    <div className="absolute inset-0 font-mono text-cw-cyan/15 leading-5 overflow-hidden select-none" style={{ fontSize: "10px" }}>
+                      {Array.from({ length: 4 }, (_, i) => (
+                        <div key={i}>{Array.from({ length: 80 }, () => Math.random() > 0.5 ? "1" : "0").join("")}</div>
                       ))}
                     </div>
                     <motion.div
                       className="absolute left-0 right-0 h-6 pointer-events-none"
-                      style={{
-                        background:
-                          "linear-gradient(180deg, transparent, rgba(0,245,255,0.08), transparent)",
-                      }}
+                      style={{ background: "linear-gradient(180deg, transparent, rgba(0,245,255,0.08), transparent)" }}
                       animate={{ top: ["-20%", "120%"] }}
                       transition={{ duration: 1.5, repeat: Infinity, ease: "linear" }}
                     />
@@ -364,25 +371,18 @@ function DashboardInner() {
           {/* Results panel */}
           <AnimatePresence>
             {result && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="max-w-3xl mx-auto"
-              >
-                {/* Scanned address header */}
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="max-w-3xl mx-auto">
+
+                {/* Scan target header */}
                 <motion.div
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="mb-6 panel p-4 flex items-center justify-between"
+                  className="mb-6 panel p-4 flex items-center justify-between flex-wrap gap-3"
                 >
                   <div>
-                    <span className="font-mono text-xs text-cw-muted tracking-widest">
-                      SCAN TARGET
-                    </span>
+                    <span className="font-mono text-xs text-cw-muted tracking-widest">SCAN TARGET</span>
                     <br />
-                    <span className="font-mono text-sm text-cw-cyan break-all">
-                      {scannedAddress}
-                    </span>
+                    <span className="font-mono text-sm text-cw-cyan break-all">{scannedAddress}</span>
                   </div>
                   <button
                     onClick={resetScan}
@@ -399,46 +399,22 @@ function DashboardInner() {
                   transition={{ delay: 0.1 }}
                   className="panel p-8 mb-6 flex flex-col md:flex-row items-center gap-8"
                 >
-                  <RiskGauge
-                    score={result.riskScore}
-                    riskLevel={result.riskLevel}
-                  />
+                  <RiskGauge score={result.riskScore} riskLevel={result.riskLevel} />
                   <div className="flex-1">
-                    <div
-                      className="font-mono text-xs tracking-widest text-cw-muted uppercase mb-3"
-                    >
+                    <div className="font-mono text-xs tracking-widest text-cw-muted uppercase mb-3">
                       Executive Summary
                     </div>
-                    <p
-                      className="font-body text-lg leading-relaxed"
-                      style={{ color: riskScoreColor }}
-                    >
+                    <p className="font-body text-lg leading-relaxed" style={{ color: riskScoreColor }}>
                       {result.summary}
                     </p>
-
-                    {/* Wallet stats grid */}
                     <div className="mt-4 grid grid-cols-2 gap-2">
                       {[
                         ["Risk Score", `${result.riskScore}/100`],
-                        [
-                          "Flags Triggered",
-                          `${result.flagAnalysis.filter((f) => f.flagged).length} of ${result.flagAnalysis.length}`,
-                        ],
+                        ["Flags Triggered", `${result.flagAnalysis.filter((f) => f.flagged).length} of ${result.flagAnalysis.length}`],
                       ].map(([label, value]) => (
-                        <div
-                          key={label}
-                          className="px-3 py-2 border border-cw-border"
-                          style={{ background: "rgba(255,255,255,0.02)" }}
-                        >
-                          <div className="font-mono text-xs text-cw-muted">
-                            {label}
-                          </div>
-                          <div
-                            className="font-mono text-sm font-bold mt-0.5"
-                            style={{ color: riskScoreColor }}
-                          >
-                            {value}
-                          </div>
+                        <div key={label} className="px-3 py-2 border border-cw-border" style={{ background: "rgba(255,255,255,0.02)" }}>
+                          <div className="font-mono text-xs text-cw-muted">{label}</div>
+                          <div className="font-mono text-sm font-bold mt-0.5" style={{ color: riskScoreColor }}>{value}</div>
                         </div>
                       ))}
                     </div>
@@ -446,12 +422,7 @@ function DashboardInner() {
                 </motion.div>
 
                 {/* Flag breakdown */}
-                <motion.div
-                  initial={{ opacity: 0, y: 30 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.2 }}
-                  className="mb-6"
-                >
+                <motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }} className="mb-6">
                   <div className="font-mono text-xs tracking-widest text-cw-muted uppercase mb-3 px-1">
                     Signal Breakdown
                   </div>
@@ -470,72 +441,76 @@ function DashboardInner() {
                 </motion.div>
 
                 {/* CIPHER Verdict */}
-                <motion.div
-                  initial={{ opacity: 0, y: 30 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.4 }}
-                  className="mb-8 panel"
-                >
+                <motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }} className="mb-6 panel">
                   <div className="px-5 py-3 border-b border-cw-border flex items-center gap-3">
-                    <div
-                      className="w-2 h-2 rounded-full"
-                      style={{
-                        background: riskScoreColor,
-                        boxShadow: `0 0 8px ${riskScoreColor}`,
-                      }}
-                    />
-                    <span className="font-mono text-xs tracking-widest text-cw-cyan uppercase">
-                      CIPHER Verdict
-                    </span>
-                    <span className="font-mono text-xs text-cw-muted ml-auto">
-                      AI Analysis
-                    </span>
+                    <div className="w-2 h-2 rounded-full" style={{ background: riskScoreColor, boxShadow: `0 0 8px ${riskScoreColor}` }} />
+                    <span className="font-mono text-xs tracking-widest text-cw-cyan uppercase">CIPHER Verdict</span>
+                    <span className="font-mono text-xs text-cw-muted ml-auto">AI Analysis</span>
                   </div>
                   <div className="p-5">
                     <p className="font-mono text-sm text-cw-text leading-relaxed">
-                      <span
-                        className="font-bold"
-                        style={{ color: riskScoreColor }}
-                      >
-                        CIPHER:{" "}
-                      </span>
+                      <span className="font-bold" style={{ color: riskScoreColor }}>CIPHER: </span>
                       {result.verdict}
                     </p>
                   </div>
-                  {/* Terminal scanlines */}
                   <div className="px-5 pb-4 flex items-center gap-2">
-                    <div
-                      className="h-px flex-1"
-                      style={{
-                        background: `linear-gradient(90deg, ${riskScoreColor}40, transparent)`,
-                      }}
-                    />
-                    <span className="font-mono text-xs text-cw-muted/40">
-                      END OF REPORT
-                    </span>
+                    <div className="h-px flex-1" style={{ background: `linear-gradient(90deg, ${riskScoreColor}40, transparent)` }} />
+                    <span className="font-mono text-xs text-cw-muted/40">END OF REPORT</span>
                   </div>
                 </motion.div>
 
-                {/* Tx confirmed notice */}
-                {txConfirmed && (
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mb-6 px-4 py-3 border border-cw-green/30 bg-cw-green/5 font-mono text-xs text-cw-green"
-                  >
-                    ✓ Scan recorded on-chain (Tx: {pendingTxHash?.slice(0, 10)}…)
-                  </motion.div>
-                )}
+                {/* On-chain recording -- explicit button */}
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.6 }}
+                  className="mb-8 panel p-5"
+                >
+                  <div className="flex items-center justify-between flex-wrap gap-4">
+                    <div>
+                      <p className="font-mono text-xs text-cw-cyan tracking-widest uppercase mb-1">
+                        Record On-Chain
+                      </p>
+                      <p className="font-body text-sm text-cw-muted">
+                        Permanently store this scan result on Ritual Chain. Costs 0.001 RITUAL.
+                      </p>
+                    </div>
+                    {!txConfirmed ? (
+                      <button
+                        onClick={() => result && recordOnChain(result, scannedAddress)}
+                        disabled={txRecording}
+                        className="px-6 py-3 font-mono text-sm font-bold border border-cw-cyan/40 text-cw-cyan hover:bg-cw-cyan/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 flex-shrink-0"
+                      >
+                        {txRecording ? (
+                          <>
+                            <motion.span
+                              animate={{ rotate: 360 }}
+                              transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+                              className="inline-block"
+                            >
+                              ~
+                            </motion.span>
+                            WAITING FOR METAMASK...
+                          </>
+                        ) : (
+                          "RECORD ON-CHAIN"
+                        )}
+                      </button>
+                    ) : (
+                      <div className="px-4 py-2 border border-cw-green/30 bg-cw-green/5 font-mono text-xs text-cw-green flex-shrink-0">
+                        v RECORDED -- {pendingTxHash?.slice(0, 14)}...
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+
               </motion.div>
             )}
           </AnimatePresence>
         </div>
 
-        {/* Right sidebar: Scan History */}
-        <div
-          className="hidden lg:block w-72 border-l border-cw-border flex-shrink-0"
-          style={{ minHeight: "calc(100vh - 57px)" }}
-        >
+        {/* Right sidebar -- Scan History */}
+        <div className="hidden lg:block w-72 border-l border-cw-border flex-shrink-0" style={{ minHeight: "calc(100vh - 57px)" }}>
           <ScanHistory onSelectScan={handleSelectScan} />
         </div>
       </div>
