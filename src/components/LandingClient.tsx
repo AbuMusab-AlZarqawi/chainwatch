@@ -206,7 +206,7 @@ function LandingInner() {
           className="flex flex-wrap justify-center gap-3 mb-12"
         >
           {[
-            "8 Rule-Based Checks",
+            "Advanced Determination",
             "CIPHER AI Analysis",
             "0.001 RITUAL Per Scan",
             "On-Chain Records",
